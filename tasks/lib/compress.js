@@ -55,7 +55,6 @@ module.exports = function(grunt) {
                     }
                 }
 
-                // MOBILECORE - use orinigal name with file ext
                 var srcFilename = path.basename(src);
                 srcFilename = srcFilename.split(path.extname(src))[0];
                 var finalDestName = srcFilename.concat(filePair.orig.ext);
