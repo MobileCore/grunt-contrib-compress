@@ -10,225 +10,194 @@
 
 var fs = require('fs');
 var path = require('path');
-var prettyBytes = require('pretty-bytes');
-var chalk = require('chalk');
+var prettySize = require('prettysize');
 var zlib = require('zlib');
 var archiver = require('archiver');
+var Readable = require('lazystream').Readable;
 
 module.exports = function(grunt) {
 
-  var exports = {
-    options: {}
-  };
+    var exports = {
+        options: {}
+    };
 
-  var fileStatSync = function() {
-    var filepath = path.join.apply(path, arguments);
+    // 1 to 1 gziping of files
+    exports.gzip = function(files, done) {
+        //console.log("files: " + JSON.stringify(files));
+        exports.singleFile(files, zlib.createGzip, 'gz', done);
+    };
 
-    if (grunt.file.exists(filepath)) {
-      return fs.statSync(filepath);
-    }
+    // 1 to 1 deflate of files
+    exports.deflate = function(files, done) {
+        exports.singleFile(files, zlib.createDeflate, 'deflate', done);
+    };
 
-    return false;
-  };
+    // 1 to 1 deflateRaw of files
+    exports.deflateRaw = function(files, done) {
+        exports.singleFile(files, zlib.createDeflateRaw, 'deflate', done);
+    };
 
-  // 1 to 1 gziping of files
-  exports.gzip = function(files, done) {
-    exports.singleFile(files, zlib.createGzip, 'gz', done);
-  };
+    // 1 to 1 compression of files, expects a compatible zlib method to be passed in, see above
+    exports.singleFile = function(files, algorithm, extension, done) {
+        grunt.util.async.forEachSeries(files, function(filePair, nextPair) {
+            grunt.util.async.forEachSeries(filePair.src, function(src, nextFile) {
+                // Must be a file
+                if (grunt.file.isDir(src)) {
+                    return nextFile();
+                }
 
-  // 1 to 1 deflate of files
-  exports.deflate = function(files, done) {
-    exports.singleFile(files, zlib.createDeflate, 'deflate', done);
-  };
+                // Append ext if the specified one isnt there
+                if (typeof filePair.orig.ext === 'undefined') {
+                    var ext = '.' + extension;
+                    // if the chosen ext is different then the dest ext lets use it
+                    if (String(filePair.dest).slice(-ext.length) !== ext) {
+                        filePair.dest += ext;
+                    }
+                }
 
-  // 1 to 1 deflateRaw of files
-  exports.deflateRaw = function(files, done) {
-    exports.singleFile(files, zlib.createDeflateRaw, 'deflate', done);
-  };
+                // MOBILECORE - use orinigal name with file ext
+                var srcFilename = path.basename(src);
+                srcFilename = srcFilename.split(path.extname(src))[0];
+                var finalDestName = srcFilename.concat(filePair.orig.ext);
+                filePair.dest = path.dirname(filePair.dest) + "/" + finalDestName;
 
-  // 1 to 1 compression of files, expects a compatible zlib method to be passed in, see above
-  exports.singleFile = function(files, algorithm, extension, done) {
-    grunt.util.async.forEachSeries(files, function(filePair, nextPair) {
-      grunt.util.async.forEachSeries(filePair.src, function(src, nextFile) {
-        // Must be a file
-        if (grunt.file.isDir(src)) {
-          return nextFile();
+                var srcStream = fs.createReadStream(src);
+                var destStream = fs.createWriteStream(filePair.dest);
+                var compressor = algorithm.call(zlib, exports.options);
+
+                compressor.on('error', function(err) {
+                    grunt.log.error(err);
+                    grunt.fail.warn(algorithm + ' failed.');
+                    nextFile();
+                });
+
+                destStream.on('close', function() {
+                    grunt.log.writeln('Created ' + String(filePair.dest).cyan + ' (' + exports.getSize(filePair.dest) + ')');
+                    nextFile();
+                });
+
+                srcStream.pipe(compressor).pipe(destStream);
+            }, nextPair);
+        }, done);
+    };
+
+    // Compress with tar, tgz and zip
+    exports.tar = function(files, done) {
+        if (typeof exports.options.archive !== 'string' || exports.options.archive.length === 0) {
+            grunt.fail.warn('Unable to compress; no valid archive file was specified.');
         }
 
-        // Ensure the dest folder exists
-        grunt.file.mkdir(path.dirname(filePair.dest));
+        var mode = exports.options.mode;
+        var shouldGzip = false;
+        if (mode === 'tgz') {
+            shouldGzip = true;
+            mode = 'tar';
+        }
 
-        var srcStream = fs.createReadStream(src);
-        var destStream = fs.createWriteStream(filePair.dest);
-        var compressor = algorithm.call(zlib, exports.options);
+        var archive = archiver.create(mode, exports.options);
+        var dest = exports.options.archive;
 
-        compressor.on('error', function(err) {
-          grunt.log.error(err);
-          grunt.fail.warn(algorithm + ' failed.');
-          nextFile();
+        // Ensure dest folder exists
+        grunt.file.mkdir(path.dirname(dest));
+
+        // Where to write the file
+        var destStream = fs.createWriteStream(dest);
+        var gzipStream;
+
+        archive.on('error', function(err) {
+            grunt.log.error(err);
+            grunt.fail.warn('Archiving failed.');
+        });
+
+        destStream.on('error', function(err) {
+            grunt.log.error(err);
+            grunt.fail.warn('WriteStream failed.');
         });
 
         destStream.on('close', function() {
-          var originalSize = exports.getSize(src);
-          var compressedSize = exports.getSize(filePair.dest);
-          var ratio = Math.round(parseInt(compressedSize) / parseInt(originalSize) * 100) + '%';
-
-          grunt.log.writeln('Created ' + chalk.cyan(filePair.dest) + ' (' + compressedSize + ') - ' + chalk.cyan(ratio) + ' of the original size');
-          nextFile();
+            grunt.log.writeln('Created ' + String(dest).cyan + ' (' + exports.getSize(dest) + ')');
+            done();
         });
 
-        srcStream.pipe(compressor).pipe(destStream);
-      }, nextPair);
-    }, done);
-  };
+        if (shouldGzip) {
+            gzipStream = zlib.createGzip(exports.options);
 
-  // Compress with tar, tgz and zip
-  exports.tar = function(files, done) {
-    if (typeof exports.options.archive !== 'string' || exports.options.archive.length === 0) {
-      grunt.fail.warn('Unable to compress; no valid archive file was specified.');
-      return;
-    }
+            gzipStream.on('error', function(err) {
+                grunt.log.error(err);
+                grunt.fail.warn('Gziping failed.');
+            });
 
-    var mode = exports.options.mode;
-    if (mode === 'tgz') {
-      mode = 'tar';
-      exports.options.gzip = true;
-    }
-
-    var archive = archiver.create(mode, exports.options);
-    var dest = exports.options.archive;
-
-    var dataWhitelist = ['comment', 'date', 'mode', 'store'];
-    var sourcePaths = {};
-
-    // Ensure dest folder exists
-    grunt.file.mkdir(path.dirname(dest));
-
-    // Where to write the file
-    var destStream = fs.createWriteStream(dest);
-
-    archive.on('error', function(err) {
-      grunt.log.error(err);
-      grunt.fail.warn('Archiving failed.');
-    });
-
-    archive.on('entry', function(file) {
-      var sp = sourcePaths[file.name] || 'unknown';
-      grunt.verbose.writeln('Archived ' + chalk.cyan(sp) + ' -> ' + chalk.cyan(dest + '/' + file.name));
-    });
-
-    destStream.on('error', function(err) {
-      grunt.log.error(err);
-      grunt.fail.warn('WriteStream failed.');
-    });
-
-    destStream.on('close', function() {
-      var size = archive.pointer();
-      grunt.log.writeln('Created ' + chalk.cyan(dest) + ' (' + exports.getSize(size) + ')');
-      done();
-    });
-
-    archive.pipe(destStream);
-
-    files.forEach(function(file) {
-      var isExpandedPair = file.orig.expand || false;
-
-      file.src.forEach(function(srcFile) {
-        var fstat = fileStatSync(srcFile);
-
-        if (!fstat) {
-          grunt.fail.warn('unable to stat srcFile (' + srcFile + ')');
-          return;
-        }
-
-        var internalFileName = (isExpandedPair) ? file.dest : exports.unixifyPath(path.join(file.dest || '', srcFile));
-
-        // check if internal file name is not a dot, should not be present in an archive
-        if (internalFileName === '.') {
-          return;
-        }
-
-        if (fstat.isDirectory() && internalFileName.slice(-1) !== '/') {
-          srcFile += '/';
-          internalFileName += '/';
-        }
-
-        var fileData = {
-          name: internalFileName,
-          stats: fstat
-        };
-
-        for (var i = 0; i < dataWhitelist.length; i++) {
-          if (typeof file[dataWhitelist[i]] === 'undefined') {
-            continue;
-          }
-
-          if (typeof file[dataWhitelist[i]] === 'function') {
-            fileData[dataWhitelist[i]] = file[dataWhitelist[i]](srcFile);
-          } else {
-            fileData[dataWhitelist[i]] = file[dataWhitelist[i]];
-          }
-        }
-
-        if (fstat.isFile()) {
-          archive.file(srcFile, fileData);
-        } else if (fstat.isDirectory()) {
-          archive.append(null, fileData);
+            archive.pipe(gzipStream).pipe(destStream);
         } else {
-          grunt.fail.warn('srcFile (' + srcFile + ') should be a valid file or directory');
-          return;
+            archive.pipe(destStream);
         }
 
-        sourcePaths[internalFileName] = srcFile;
-      });
-    });
+        files.forEach(function(file) {
+            var isExpandedPair = file.orig.expand || false;
+            var src = file.src.filter(function(f) {
+                return grunt.file.isFile(f);
+            });
 
-    archive.finalize();
-  };
+            src.forEach(function(srcFile) {
+                var internalFileName = (isExpandedPair) ? file.dest : exports.unixifyPath(path.join(file.dest || '', srcFile));
+                var srcStream = new Readable(function() {
+                    return fs.createReadStream(srcFile);
+                });
 
-  exports.getSize = function(filename, pretty) {
-    var size = 0;
-    if (typeof filename === 'string') {
-      try {
-        size = fs.statSync(filename).size;
-      } catch (e) {}
-    } else {
-      size = filename;
-    }
-    if (pretty !== false) {
-      if (!exports.options.pretty) {
-        return size + ' bytes';
-      }
-      return prettyBytes(size);
-    }
-    return Number(size);
-  };
+                archive.append(srcStream, {
+                    name: internalFileName
+                }, function(err) {
+                    grunt.verbose.writeln('Archiving ' + srcFile.cyan + ' -> ' + String(dest).cyan + '/'.cyan + internalFileName.cyan);
+                });
+            });
+        });
 
-  exports.autoDetectMode = function(dest) {
-    if (exports.options.mode) {
-      return exports.options.mode;
-    }
-    if (!dest) {
-      return 'gzip';
-    }
-    if (grunt.util._.endsWith(dest, '.tar.gz')) {
-      return 'tgz';
-    }
-    var ext = path.extname(dest).replace('.', '');
-    if (ext === 'gz') {
-      return 'gzip';
-    } else {
-      return ext;
-    }
-  };
+        archive.finalize();
+    };
 
-  exports.unixifyPath = function(filepath) {
-    if (process.platform === 'win32') {
-      return filepath.replace(/\\/g, '/');
-    } else {
-      return filepath;
-    }
-  };
+    exports.getSize = function(filename, pretty) {
+        var size = 0;
+        if (typeof filename === 'string') {
+            try {
+                size = fs.statSync(filename).size;
+            } catch (e) {}
+        } else {
+            size = filename;
+        }
+        if (pretty !== false) {
+            if (!exports.options.pretty) {
+                return size + ' bytes';
+            }
+            return prettySize(size);
+        }
+        return Number(size);
+    };
 
-  return exports;
+    exports.autoDetectMode = function(dest) {
+        if (exports.options.mode) {
+            return exports.options.mode;
+        }
+        if (!dest) {
+            return 'gzip';
+        }
+        if (grunt.util._.endsWith(dest, '.tar.gz')) {
+            return 'tgz';
+        }
+        var ext = path.extname(dest).replace('.', '');
+        if (ext === 'gz') {
+            return 'gzip';
+        } else {
+            return ext;
+        }
+    };
+
+    exports.unixifyPath = function(filepath) {
+        if (process.platform === 'win32') {
+            return filepath.replace(/\\/g, '/');
+        } else {
+            return filepath;
+        }
+    };
+
+    return exports;
 };
